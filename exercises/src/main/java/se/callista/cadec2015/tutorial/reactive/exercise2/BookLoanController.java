@@ -1,5 +1,6 @@
 package se.callista.cadec2015.tutorial.reactive.exercise2;
 
+import com.ning.http.client.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -7,8 +8,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import se.callista.cadec2015.tutorial.reactive.util.CommunicationException;
-import se.callista.cadec2015.tutorial.reactive.util.blocking.UtilBlocking;
+import org.springframework.web.context.request.async.DeferredResult;
+import se.callista.cadec2015.tutorial.reactive.util.callback.UtilCallback;
 
 @RestController
 public class BookLoanController {
@@ -20,7 +21,7 @@ public class BookLoanController {
     private static final String RESULT_RESERVED = "RESERVED";
 
     @Autowired
-    private UtilBlocking util;
+    private UtilCallback util;
 
     /**
      * Sample usage:
@@ -31,52 +32,54 @@ public class BookLoanController {
      * @return
      */
     @RequestMapping("/bookLoan")
-    public ResponseEntity<String> routingSlip(
+    public DeferredResult<ResponseEntity<String>> bookLoan(
         @RequestParam (value = "bookId",     required = true) String bookId,
         @RequestParam (value = "customerId", required = true) String customerId) {
 
-        try {
-            LOG.debug("Start processing bookLoan request, bookId: {}, customerId: {}", bookId, customerId);
+        LOG.debug("Start processing bookLoan request, bookId: {}, customerId: {}", bookId, customerId);
 
-            String action = null;
-            long timestamp = System.currentTimeMillis();
+        long timestamp = System.currentTimeMillis();
 
-            ResponseEntity<String> response;
+        DeferredResult<ResponseEntity<String>> deferredResult = new DeferredResult<>();
 
-            // Send blocking request #1, check customer
-            response = util.execute("#1, check customer", "/library/checkCustomer?customerId=" + customerId);
+        // Send request #1, check customer
+        util.execute(deferredResult, "#1, check customer", "/library/checkCustomer?customerId=" + customerId,
+            (Response r1) -> {
 
-            // Send blocking request #2, check book
-            response = util.execute("#2, check book", "/library/checkBook?bookId=" + bookId);
+                // Send request #2, check book
+                util.execute(deferredResult, "#2, check book", "/library/checkBook?bookId=" + bookId,
+                    (Response r2) -> {
 
-            // Decide if we can borrow the book or if we have to reserve it for a later borrow
-            LibraryActionResult lar = util.response2LibraryActionResult(response);
-            if (lar.getActionResult().equals(RESULT_AVAILABLE)) {
+                        // Decide if we can borrow the book or if we have to reserve it for a later borrow
+                        boolean isAvailable = util.response2LibraryActionResult(r2).getActionResult().equals(RESULT_AVAILABLE);
 
-                // Send blocking request #3.1, borrow book
-                action = RESULT_BORROWED;
-                response = util.execute("#3.1, borrow book", "/library/borrowBook?bookId=" + bookId + "&customerId=" + customerId);
+                        String requestName =  isAvailable ? "#3.1, borrow book" : "#3.2, reserve book";
+                        String action      =  isAvailable ? RESULT_BORROWED     : RESULT_RESERVED;
+                        String url3        =  "/library/" + (isAvailable ? "borrowBook" : "reserveBook") + "?bookId=" + bookId + "&customerId=" + customerId;
 
-            } else {
+                        // Send request #3, borrow or reserve book
+                        util.execute(deferredResult, requestName, url3,
+                            (Response r3) -> {
 
-                // Send blocking request #3.2, reserve book
-                action = RESULT_RESERVED;
-                response = util.execute("#3.2, reserve book", "/library/reserveBook?bookId=" + bookId + "&customerId=" + customerId);
+                                // Send final request #4, confirm book borrow/reserve operation
+                                util.execute(deferredResult, "#4, confirm", "/library/confirmBook?bookId=" + bookId + "&customerId=" + customerId,
+                                    (Response r4) -> {
+
+                                        // We are done, create a response and send it back to the caller
+                                        long processingTimeMs = System.currentTimeMillis() - timestamp;
+                                        LOG.debug("Processing complete, time: {} ms", processingTimeMs);
+                                        deferredResult.setResult(util.libraryActionResult2Response(action, (int) processingTimeMs));
+                                    }
+                                );
+                            }
+                        );
+                    }
+                );
             }
+        );
 
-            // Send final blocking request #4, confirm book borrow/reserve operation
-            response = util.execute("#4, confirm", "/library/confirmBook?bookId=" + bookId + "&customerId=" + customerId);
-
-            // We are done, create a response and send it back to the caller
-            long processingTimeMs = System.currentTimeMillis() - timestamp;
-            LOG.debug("Processing complete, time: {} ms", processingTimeMs);
-            return util.libraryActionResult2Response(action, (int) processingTimeMs);
-
-        } catch(CommunicationException commEx) {
-
-            // Handle timeout and other communications errors
-            LOG.error("Processing aborted with an error in request {}", commEx.getRequestName());
-            return commEx.getErrorResponse();
-        }
+        // Return to let go of the precious thread we are holding on to...
+        LOG.debug("Non-blocking processing setup, return the request thread to the thread-pool");
+        return deferredResult;
     }
 }
